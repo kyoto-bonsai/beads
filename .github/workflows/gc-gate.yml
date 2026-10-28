@@ -1,0 +1,532 @@
+# gc-gate: beads upstream make test (Bazel unit/nogo/gofmt/repository guards) on the exact patch and base.
+# Publishes one receipt as the check-run annotation `gc-gate-receipt`. Dispatched only; no secrets.
+
+name: gc-gate
+run-name: "gate ${{ inputs.run_key }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      head_sha:
+        required: true
+        type: string
+      base_sha:
+        required: true
+        type: string
+      patch_sha256:
+        required: true
+        type: string
+      run_key:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      # make test's Bazel flags; the receipt records them. --config=ci is upstream's lane policy. The two
+      # --local_resources caps (result policy, no action key) bound Bazel's local scheduling to half the runner's RAM
+      # and three of its four cores: a run whose tests were done was lost
+      # in nogo, receipt and all.
+      GATE_BAZEL_FLAGS: "--local_resources=memory=HOST_RAM*.5 --local_resources=cpu=HOST_CPUS*.75"
+    steps:
+      - name: validate inputs
+        id: start
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          PATCH_SHA256: ${{ inputs.patch_sha256 }}
+          RUN_KEY: ${{ inputs.run_key }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid head_sha: $HEAD_SHA"
+            exit 2
+          fi
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid base_sha: $BASE_SHA"
+            exit 2
+          fi
+          if [[ ! "$PATCH_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid patch_sha256: $PATCH_SHA256"
+            exit 2
+          fi
+          if [[ ! "$RUN_KEY" =~ ^[0-9a-f]{12}-[0-9]{10}$ ]]; then
+            echo "::error::Invalid run_key: $RUN_KEY"
+            exit 2
+          fi
+          START_EPOCH=$(date +%s)
+          STARTED_AT=$(date -u +%FT%TZ)
+          DISK_START=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+          {
+            echo "start_epoch=$START_EPOCH"
+            echo "started_at=$STARTED_AT"
+            echo "disk_start=$DISK_START"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.head_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: verify base and patch
+        id: verify
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          PATCH_SHA: ${{ inputs.patch_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          git fetch --no-tags --filter=blob:none https://github.com/gastownhall/beads.git "$BASE_SHA"
+          if ! git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"; then
+            echo "::error::base not ancestor"
+            exit 3
+          fi
+          RUNNER_PATCH=$(git diff --binary --full-index --no-renames --no-ext-diff --no-textconv --no-color -U3 "$BASE_SHA" "$HEAD_SHA" | sha256sum | cut -d' ' -f1)
+          echo "patch_sha_runner=$RUNNER_PATCH" >> "$GITHUB_OUTPUT"
+          if [ "$RUNNER_PATCH" != "$PATCH_SHA" ]; then
+            echo "::error::patch mismatch"
+            echo "GATE_PRE_FAIL=patch_mismatch" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+      - name: free disk
+        if: env.GATE_PRE_FAIL == ''
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -B1 --output=avail / | tail -1
+
+      # 8 GiB of swap on the freed root disk: memory pressure pages out instead of taking the VM, and with it the
+      # receipt, down. GATE_SWAP_ADDED (bytes, 0 if not added) goes into the receipt.
+      - name: memory headroom
+        if: env.GATE_PRE_FAIL == ''
+        run: |
+          set -uo pipefail
+          swap=/gc-gate.swap
+          avail=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+          if [ "$avail" -gt 42949672960 ] && sudo fallocate -l 8G "$swap" && sudo chmod 600 "$swap" \
+              && sudo mkswap "$swap" > /dev/null && sudo swapon "$swap"; then
+            echo "GATE_SWAP_ADDED=8589934592" >> "$GITHUB_ENV"
+          else
+            echo "::warning::gc-gate swap file not added (root avail $avail bytes)"
+            echo "GATE_SWAP_ADDED=0" >> "$GITHUB_ENV"
+          fi
+          free -b || true
+          swapon --show || true
+
+      - name: Set up Bazel
+        if: env.GATE_PRE_FAIL == ''
+        uses: ./.github/actions/setup-bazel
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        if: env.GATE_PRE_FAIL == ''
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Provide /usr/local/go
+        if: env.GATE_PRE_FAIL == ''
+        run: |
+          if [ ! -e /usr/local/go ]; then
+            sudo ln -s "$(go env GOROOT)" /usr/local/go
+          elif [ ! -x /usr/local/go/bin/go ]; then
+            echo "::warning::/usr/local/go exists without bin/go; tests that exec go may fail"
+          fi
+
+      # The code under test runs here: workflow commands are off while it runs, so it cannot print an annotation
+      # (a second receipt) or other commands; GATE_RC is written after it, so it is the last value.
+      # The sampler writes one gc-gate-sample line every 30 s (t = seconds into this step; memory, swap, disk, load,
+      # OOM kills, the top RSS process) to the log and to $RUNNER_TEMP/gate-samples.log. It starts after stop-commands,
+      # polls a halt file once a second and is gone (or killed) within 10 s of make's end; it takes no signal, so no
+      # stop can be lost. Where sudo can make a cgroup, make runs in it: memory.max leaves the runner 1 GiB, and what
+      # make leaves running (a daemon a test started has no runner tracking id) is counted and killed before the
+      # receipt. The post-check sample is also the gc-gate-post annotation, which a lost runner keeps; its log it does not.
+      - name: make test
+        id: gate
+        if: env.GATE_PRE_FAIL == ''
+        timeout-minutes: 320
+        run: |
+          mkdir -p /tmp/bt
+          set -o pipefail
+          rc=0
+          t0=$(date +%s)
+          stop=$(openssl rand -hex 16)
+          samples="$RUNNER_TEMP/gate-samples.log"
+          halt="$RUNNER_TEMP/gate-sampler.halt"
+          rm -f "$halt"
+          tail_fields=""
+          sample() {
+            set -- $(awk '/^MemAvailable:/ {a = $2} /^SwapFree:/ {s = $2} END {print a + 0, s + 0}' /proc/meminfo)
+            top=$(ps -eo rss=,comm= --sort=-rss | head -1 | awk '{gsub(/[^A-Za-z0-9_.-]/, "", $2); print $1 "/" substr($2, 1, 24)}')
+            line="gc-gate-sample t=$(( $(date +%s) - t0 )) mem_avail_kb=$1 swap_free_kb=$2"
+            line="$line disk_avail_b=$(df -B1 --output=avail / | tail -1 | tr -d ' ') load1=$(cut -d' ' -f1 /proc/loadavg)"
+            line="$line oom_kill=$(awk '/^oom_kill / {print $2}' /proc/vmstat) top_rss=$top$tail_fields"
+            echo "$line" >> "$samples"
+            echo "$line"
+          }
+          cg="${GATE_CGROUP_ROOT:-/sys/fs/cgroup}/gc-gate-check"
+          cg_max=$(( ($(awk '/^MemTotal:/ {print $2}' /proc/meminfo) - 1048576) * 1024 ))
+          if [ "$cg_max" -gt 0 ] && sudo -n mkdir -p "$cg" 2> /dev/null \
+              && echo "$cg_max" | sudo -n tee "$cg/memory.max" > /dev/null 2>&1; then
+            echo "gc-gate cgroup $cg memory.max=$cg_max"
+          else
+            cg=""
+            echo "gc-gate cgroup not made: make test runs in the step's cgroup"
+          fi
+          in_cgroup() {
+            if [ -n "$cg" ]; then
+              self=$BASHPID
+              echo "$self" | sudo -n tee "$cg/cgroup.procs" > /dev/null 2>&1 || true
+            fi
+            exec "$@"
+          }
+          stop_sampler() {
+            : > "$halt"
+            n=0
+            while kill -0 "$sampler" 2> /dev/null && [ "$n" -lt 100 ]; do
+              sleep 0.1
+              n=$((n + 1))
+            done
+            kill -KILL "$sampler" 2> /dev/null
+            wait "$sampler" 2> /dev/null
+          }
+          left=0 left_rss_kb=0 left_top=none reaped=none
+          reap() {
+            [ -n "$cg" ] || return 0
+            pids=$(tr '\n' ' ' < "$cg/cgroup.procs")
+            set -- $pids
+            [ "$#" -gt 0 ] || return 0
+            left=$#
+            set -- $(ps -o rss=,comm= -p "$(echo $pids | tr ' ' ',')" | sort -rn \
+              | awk '{r += $1} NR == 1 {gsub(/[^A-Za-z0-9_.-]/, "", $2); t = substr($2, 1, 24)} END {print r + 0, (t == "" ? "none" : t)}')
+            left_rss_kb=${1:-0} left_top=${2:-none} reaped=partial
+            echo 1 | sudo -n tee "$cg/cgroup.kill" > /dev/null 2>&1
+            n=0
+            while [ -s "$cg/cgroup.procs" ] && [ "$n" -lt 100 ]; do
+              sleep 0.1
+              n=$((n + 1))
+            done
+            [ -s "$cg/cgroup.procs" ] || reaped=all
+          }
+          echo "::stop-commands::$stop"
+          ( set +e
+            while [ ! -e "$halt" ]; do
+              sample
+              n=0
+              while [ "$n" -lt 30 ] && [ ! -e "$halt" ]; do
+                sleep 1 < /dev/null > /dev/null 2>&1
+                n=$((n + 1))
+              done
+            done ) &
+          sampler=$!
+          in_cgroup make test BAZEL_FLAGS="$GATE_BAZEL_FLAGS --build_event_json_file=$RUNNER_TEMP/bep.json" 2>&1 | tee "$RUNNER_TEMP/make.log" || rc=$?
+          stop_sampler || true
+          reap || true
+          cgroup=0
+          [ -z "$cg" ] || cgroup=1
+          tail_fields=" left=$left left_rss_kb=$left_rss_kb left_top=$left_top reaped=$reaped cgroup=$cgroup"
+          post=$(sample) || post="gc-gate-sample post failed"
+          echo "$post"
+          echo "::$stop::"
+          echo "::notice title=gc-gate-post::$post"
+          echo "GATE_RC=$rc" >> "$GITHUB_ENV"
+          echo "make test exit $rc"
+
+      # Bounded: 10 min, 2 GiB of address space, a 240 s BEP walk (past it, counts is null and the gate fails
+      # closed). What a timed-out make test left in its cgroup is killed first.
+      - name: receipt
+        if: always()
+        timeout-minutes: 10
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          PATCH_SHA: ${{ inputs.patch_sha256 }}
+          RUN_KEY: ${{ inputs.run_key }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SERVER: ${{ github.server_url }}
+          WF_SHA: ${{ github.workflow_sha }}
+          START_EPOCH: ${{ steps.start.outputs.start_epoch }}
+          STARTED_AT: ${{ steps.start.outputs.started_at }}
+          DISK_START: ${{ steps.start.outputs.disk_start }}
+          PATCH_SHA_RUNNER: ${{ steps.verify.outputs.patch_sha_runner }}
+        run: |
+          cg="${GATE_CGROUP_ROOT:-/sys/fs/cgroup}/gc-gate-check"
+          if [ -e "$cg/cgroup.kill" ]; then
+            echo 1 | sudo -n tee "$cg/cgroup.kill" > /dev/null 2>&1 || true
+          fi
+          ulimit -v 2097152
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import re
+          import subprocess
+          import time
+          from datetime import datetime, timezone
+
+          gate_rc = os.environ.get("GATE_RC")
+          gate_pre_fail = os.environ.get("GATE_PRE_FAIL")
+
+          if gate_rc is not None and gate_rc != "":
+              exit_code = int(gate_rc)
+          elif gate_pre_fail:
+              exit_code = 2
+          else:
+              exit_code = 1
+
+          pre_fail = gate_pre_fail if gate_pre_fail else None
+
+          runner_temp = os.environ.get("RUNNER_TEMP", "/tmp")
+
+          make_failed_target = None
+          make_log_path = os.path.join(runner_temp, "make.log")
+          if os.path.isfile(make_log_path):
+              make_error = re.compile(r"make: \*\*\* \[(?:[^\]:\n]*:\d+: )?([A-Za-z0-9_.-]+)\] Error")
+              with open(make_log_path, "r", encoding="utf-8", errors="replace") as f:
+                  for line in f:
+                      match = make_error.search(line)
+                      if match:
+                          make_failed_target = match.group(1)
+
+          bep_path = os.path.join(runner_temp, "bep.json")
+          counts = None
+          bep_bad_lines = 0
+          bep_deadline_hit = False
+          bep_deadline = time.monotonic() + 240
+
+          if os.path.isfile(bep_path):
+              targets = 0
+              passed = 0
+              failed = 0
+              flaky = 0
+              no_status = 0
+              test_summary_labels = set()
+              test_result_runs = {}
+
+              with open(bep_path, "r", encoding="utf-8", errors="replace") as f:
+                  for line in f:
+                      if time.monotonic() > bep_deadline:
+                          bep_deadline_hit = True
+                          break
+                      line_str = line.strip()
+                      if not line_str:
+                          continue
+                      try:
+                          event = json.loads(line_str)
+                      except Exception:
+                          bep_bad_lines += 1
+                          continue
+
+                      event_id = event.get("id")
+                      if not isinstance(event_id, dict):
+                          continue
+
+                      if "testResult" in event_id:
+                          tr_id = event_id.get("testResult")
+                          if isinstance(tr_id, dict):
+                              label = tr_id.get("label")
+                              if label:
+                                  tr_payload = event.get("testResult")
+                                  cached_loc = False
+                                  cached_rem = False
+                                  if isinstance(tr_payload, dict):
+                                      cached_loc = bool(tr_payload.get("cachedLocally"))
+                                      exec_info = tr_payload.get("executionInfo")
+                                      if isinstance(exec_info, dict):
+                                          cached_rem = bool(exec_info.get("cachedRemotely"))
+                                  is_cached = cached_loc or cached_rem
+                                  test_result_runs.setdefault(label, []).append(is_cached)
+
+                      if "testSummary" in event_id:
+                          targets += 1
+                          ts_id = event_id.get("testSummary")
+                          if isinstance(ts_id, dict):
+                              label = ts_id.get("label")
+                              if label:
+                                  test_summary_labels.add(label)
+                          ts_payload = event.get("testSummary")
+                          status = ""
+                          if isinstance(ts_payload, dict):
+                              status = ts_payload.get("overallStatus", "")
+
+                          if status == "PASSED":
+                              passed += 1
+                          elif status == "FLAKY":
+                              flaky += 1
+                          elif status in ("FAILED", "TIMEOUT", "REMOTE_FAILURE", "FAILED_TO_BUILD", "INCOMPLETE"):
+                              failed += 1
+                          elif status == "NO_STATUS":
+                              no_status += 1
+                          else:
+                              failed += 1
+
+              cached = sum(
+                  1 for label, runs in test_result_runs.items()
+                  if label in test_summary_labels and runs and all(runs)
+              )
+
+              counts = None if bep_deadline_hit else {
+                  "targets": targets,
+                  "passed": passed,
+                  "failed": failed,
+                  "flaky": flaky,
+                  "cached": cached,
+                  "no_status": no_status,
+              }
+
+          bazel_version = None
+          if os.path.isfile(".bazelversion"):
+              with open(".bazelversion", "r", encoding="utf-8", errors="replace") as f:
+                  first_line = f.readline()
+                  if first_line:
+                      bazel_version = first_line.strip()
+
+          bazel_flags = os.environ.get("GATE_BAZEL_FLAGS", "")
+          commands = [
+              f'make test BAZEL_FLAGS="{bazel_flags} --build_event_json_file={runner_temp}/bep.json"'
+          ]
+          swap_added = os.environ.get("GATE_SWAP_ADDED", "")
+          swap_added_bytes = int(swap_added) if swap_added.isdigit() else None
+
+          mem_total_kb = None
+          if os.path.isfile("/proc/meminfo"):
+              with open("/proc/meminfo", "r", encoding="utf-8", errors="replace") as f:
+                  for line in f:
+                      if line.startswith("MemTotal:"):
+                          mem_total_kb = int(line.split()[1])
+
+          # the sampler's lines (make test step): lows, highs and the last one
+          samples = None
+          samples_path = os.path.join(runner_temp, "gate-samples.log")
+          if os.path.isfile(samples_path):
+              rows = []
+              with open(samples_path, "r", encoding="utf-8", errors="replace") as f:
+                  for line in f:
+                      parts = line.split()
+                      if parts[:1] == ["gc-gate-sample"]:
+                          rows.append({key: value[:40] for key, value in
+                                       (part.split("=", 1) for part in parts[1:13] if "=" in part)})
+
+              def ints(key):
+                  return [int(row[key]) for row in rows if re.fullmatch(r"[0-9]{1,20}", row.get(key, ""))]
+
+              loads = []
+              for row in rows:
+                  try:
+                      loads.append(float(row.get("load1", "")))
+                  except ValueError:
+                      pass
+              oom = ints("oom_kill")
+              samples = {
+                  "n": len(rows),
+                  "min_mem_avail_kb": min(ints("mem_avail_kb"), default=None),
+                  "min_swap_free_kb": min(ints("swap_free_kb"), default=None),
+                  "min_disk_avail_b": min(ints("disk_avail_b"), default=None),
+                  "max_load1": max(loads, default=None),
+                  "oom_kill_delta": oom[-1] - oom[0] if oom else None,
+                  "last": rows[-1] if rows else None,
+              }
+
+          df_out = subprocess.check_output(["df", "-B1", "--output=avail", "/"], text=True)
+          disk_free_end_bytes = int(df_out.strip().splitlines()[-1].strip())
+
+          start_epoch_str = os.environ.get("START_EPOCH", "0")
+          start_epoch = int(start_epoch_str) if start_epoch_str.isdigit() else int(time.time())
+          now = int(time.time())
+          duration_s = now - start_epoch
+
+          started_at = os.environ.get("STARTED_AT", "")
+          finished_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          disk_start_str = os.environ.get("DISK_START", "0")
+          disk_free_start_bytes = int(disk_start_str) if disk_start_str.isdigit() else 0
+
+          head_sha = os.environ.get("HEAD_SHA", "")
+          base_sha = os.environ.get("BASE_SHA", "")
+          patch_sha = os.environ.get("PATCH_SHA", "")
+          run_key = os.environ.get("RUN_KEY", "")
+          repo = os.environ.get("REPO", "")
+          run_id = int(os.environ.get("RUN_ID", "0"))
+          run_attempt = int(os.environ.get("RUN_ATTEMPT", "1"))
+          server = os.environ.get("SERVER", "https://github.com")
+          wf_sha = os.environ.get("WF_SHA", "")
+          patch_sha_runner = os.environ.get("PATCH_SHA_RUNNER") or None
+          openapi_base_sha = None
+
+          receipt = {
+              "schema": 1,
+              "run_key": run_key,
+              "repo": repo,
+              "head_sha": head_sha,
+              "base_sha": base_sha,
+              "patch_sha256": patch_sha,
+              "patch_sha256_runner": patch_sha_runner,
+              "openapi_base_sha": openapi_base_sha,
+              "run_id": run_id,
+              "run_attempt": run_attempt,
+              "run_url": f"{server}/{repo}/actions/runs/{run_id}",
+              "workflow_sha": wf_sha,
+              "commands": commands,
+              "bazel_flags": bazel_flags,
+              "swap_added_bytes": swap_added_bytes,
+              "mem_total_kb": mem_total_kb,
+              "samples": samples,
+              "exit_code": exit_code,
+              "pre_fail": pre_fail,
+              "make_failed_target": make_failed_target,
+              "counts": counts,
+              "bep_bad_lines": bep_bad_lines,
+              "bep_deadline_hit": bep_deadline_hit,
+              "bazel_version": bazel_version,
+              "runner": {
+                  "image_os": os.environ.get("ImageOS"),
+                  "image_version": os.environ.get("ImageVersion"),
+              },
+              "started_at": started_at,
+              "finished_at": finished_at,
+              "duration_s": duration_s,
+              "disk_free_start_bytes": disk_free_start_bytes,
+              "disk_free_end_bytes": disk_free_end_bytes,
+          }
+
+          receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+          receipt_path = os.path.join(runner_temp, "receipt.json")
+          with open(receipt_path, "w", encoding="utf-8") as f:
+              f.write(receipt_json)
+
+          print(receipt_json)
+          notice_b64 = base64.b64encode(receipt_json.encode("utf-8")).decode("ascii")
+          print(f"::notice title=gc-gate-receipt::{notice_b64}")
+
+          step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if step_summary:
+              with open(step_summary, "a", encoding="utf-8") as f:
+                  f.write(
+                      f"### gc-gate receipt\n\n"
+                      f"| Key | Value |\n"
+                      f"| --- | --- |\n"
+                      f"| run_key | `{run_key}` |\n"
+                      f"| exit_code | `{exit_code}` |\n"
+                      f"| pre_fail | `{pre_fail}` |\n"
+                      f"| duration_s | `{duration_s}s` |\n"
+                  )
+          PY
+
+      - name: result
+        if: always()
+        run: |
+          if [ -n "$GATE_PRE_FAIL" ]; then
+            exit 1
+          else
+            exit "${GATE_RC:-1}"
+          fi
