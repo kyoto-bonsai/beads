@@ -300,6 +300,7 @@ jobs:
 
           bep_path = os.path.join(runner_temp, "bep.json")
           counts = None
+          test_statuses = None
           bep_bad_lines = 0
           bep_deadline_hit = False
           bep_deadline = time.monotonic() + 240
@@ -312,6 +313,9 @@ jobs:
               no_status = 0
               test_summary_labels = set()
               test_result_runs = {}
+              test_statuses_map = {}
+              test_statuses_valid = True
+              seen_summary_labels = set()
 
               with open(bep_path, "r", encoding="utf-8", errors="replace") as f:
                   for line in f:
@@ -325,17 +329,23 @@ jobs:
                           event = json.loads(line_str)
                       except Exception:
                           bep_bad_lines += 1
+                          test_statuses_valid = False
+                          continue
+
+                      if not isinstance(event, dict):
+                          test_statuses_valid = False
                           continue
 
                       event_id = event.get("id")
                       if not isinstance(event_id, dict):
+                          test_statuses_valid = False
                           continue
 
                       if "testResult" in event_id:
                           tr_id = event_id.get("testResult")
                           if isinstance(tr_id, dict):
                               label = tr_id.get("label")
-                              if label:
+                              if isinstance(label, str) and label:
                                   tr_payload = event.get("testResult")
                                   cached_loc = False
                                   cached_rem = False
@@ -352,7 +362,7 @@ jobs:
                           ts_id = event_id.get("testSummary")
                           if isinstance(ts_id, dict):
                               label = ts_id.get("label")
-                              if label:
+                              if isinstance(label, str) and label:
                                   test_summary_labels.add(label)
                           ts_payload = event.get("testSummary")
                           status = ""
@@ -370,6 +380,23 @@ jobs:
                           else:
                               failed += 1
 
+                          if not isinstance(ts_id, dict) or not isinstance(ts_payload, dict):
+                              test_statuses_valid = False
+                          else:
+                              ts_label = ts_id.get("label")
+                              ts_status = ts_payload.get("overallStatus")
+                              if not isinstance(ts_label, str) or not ts_label or not re.fullmatch(r"//[A-Za-z0-9_./+-]*:[A-Za-z0-9_./+=,@~-]+", ts_label):
+                                  test_statuses_valid = False
+                              elif ts_label in seen_summary_labels:
+                                  test_statuses_valid = False
+                              else:
+                                  seen_summary_labels.add(ts_label)
+
+                              if not isinstance(ts_status, str) or not ts_status:
+                                  test_statuses_valid = False
+                              elif test_statuses_valid:
+                                  test_statuses_map[ts_label] = ts_status
+
               cached = sum(
                   1 for label, runs in test_result_runs.items()
                   if label in test_summary_labels and runs and all(runs)
@@ -383,6 +410,18 @@ jobs:
                   "cached": cached,
                   "no_status": no_status,
               }
+
+              if bep_deadline_hit or bep_bad_lines > 0 or not test_statuses_valid:
+                  test_statuses = None
+              else:
+                  try:
+                      map_json = json.dumps(test_statuses_map, sort_keys=True)
+                      if len(map_json.encode("utf-8")) > 32768:
+                          test_statuses = None
+                      else:
+                          test_statuses = test_statuses_map
+                  except Exception:
+                      test_statuses = None
 
           bazel_version = None
           if os.path.isfile(".bazelversion"):
@@ -485,6 +524,7 @@ jobs:
               "pre_fail": pre_fail,
               "make_failed_target": make_failed_target,
               "counts": counts,
+              "test_statuses": test_statuses,
               "bep_bad_lines": bep_bad_lines,
               "bep_deadline_hit": bep_deadline_hit,
               "bazel_version": bazel_version,
