@@ -267,6 +267,7 @@ jobs:
           ulimit -v 2097152
           python3 - <<'PY'
           import base64
+          import hashlib
           import json
           import os
           import re
@@ -416,7 +417,7 @@ jobs:
               else:
                   try:
                       map_json = json.dumps(test_statuses_map, sort_keys=True)
-                      if len(map_json.encode("utf-8")) > 32768:
+                      if len(map_json.encode("utf-8")) > 524288:
                           test_statuses = None
                       else:
                           test_statuses = test_statuses_map
@@ -545,8 +546,32 @@ jobs:
               f.write(receipt_json)
 
           print(receipt_json)
-          notice_b64 = base64.b64encode(receipt_json.encode("utf-8")).decode("ascii")
-          print(f"::notice title=gc-gate-receipt::{notice_b64}")
+          receipt_bytes = receipt_json.encode("utf-8")
+          if len(receipt_bytes) > 1048576:
+              raise SystemExit("receipt transport oversize: exceeds 1048576 bytes")
+
+          notice_b64 = base64.b64encode(receipt_bytes).decode("ascii")
+          if len(notice_b64) < 4096:
+              print(f"::notice title=gc-gate-receipt::{notice_b64}")
+          else:
+              chunk_size = 3000
+              parts = (len(notice_b64) + chunk_size - 1) // chunk_size
+              for i in range(1, parts + 1):
+                  chunk = notice_b64[(i - 1) * chunk_size : i * chunk_size]
+                  print(f"gc-gate-receipt-part {i}/{parts} {chunk}")
+              manifest = {
+                  "bytes": len(receipt_bytes),
+                  "parts": parts,
+                  "run_attempt": run_attempt,
+                  "run_id": run_id,
+                  "run_key": run_key,
+                  "sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+                  "transport": "gc-gate-log-v1",
+                  "workflow_sha": wf_sha,
+              }
+              manifest_json = json.dumps(manifest, sort_keys=True, separators=(",", ":"))
+              manifest_b64 = base64.b64encode(manifest_json.encode("utf-8")).decode("ascii")
+              print(f"::notice title=gc-gate-receipt::{manifest_b64}")
 
           step_summary = os.environ.get("GITHUB_STEP_SUMMARY")
           if step_summary:
