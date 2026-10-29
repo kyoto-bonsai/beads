@@ -25,7 +25,9 @@ permissions:
 
 jobs:
   gate:
-    runs-on: ubuntu-latest
+    # An explicit image, never a floating label: upstream's unit lane runs ubuntu-24.04 for a fork PR. On ubuntu-26.04 the
+    # LLVM archive's ld.lld cannot load libxml2.so.2, so every Go target fails to build.
+    runs-on: ubuntu-24.04
     timeout-minutes: 350
     env:
       # make test's Bazel flags; the receipt records them. --config=ci is upstream's lane policy. The two
