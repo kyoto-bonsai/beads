@@ -58,6 +58,28 @@ func TestReadMetadataFlagValidatesKeysGH7921(t *testing.T) {
 	}
 }
 
+// Every top-level key is checked, not just the first one in sorted order, and
+// when several are out of grammar the error names the first in sorted order,
+// so the message does not depend on Go's random map iteration. The loop gives
+// an unsorted walk many chances to start somewhere else.
+func TestMetadataFlagKeyOrderGH7921(t *testing.T) {
+	if _, err := readMetadataFlag(`{"a_ok":"v","z:bad":"v"}`); err == nil || !strings.Contains(err.Error(), `invalid metadata key "z:bad"`) {
+		t.Fatalf("a bad key sorted after a good one: error = %v, want z:bad refused", err)
+	}
+
+	members := []string{`"a_ok":"v"`}
+	for _, key := range []string{"m:bad", "z:bad", "b:bad", "q:bad", "f:bad", "x:bad", "k:bad"} {
+		members = append(members, `"`+key+`":"v"`)
+	}
+	value := "{" + strings.Join(members, ",") + "}"
+	for i := 0; i < 64; i++ {
+		_, err := readMetadataFlag(value)
+		if err == nil || !strings.Contains(err.Error(), `invalid metadata key "b:bad"`) {
+			t.Fatalf("run %d: error = %v, want the first sorted bad key b:bad", i, err)
+		}
+	}
+}
+
 func TestInputBadMetadataKeyGH7921(t *testing.T) {
 	createCmd := newCreateFlagsCommand(t, "--title", "Title", "--metadata", `{"bad:key":"v"}`)
 	var err error
