@@ -9,9 +9,11 @@ import (
 	"time"
 )
 
-// Keep the process/proxy/commit boundary real: previews must not publish and a
-// rejected duplicate closure must roll its new dependency back.
-func TestProxiedShipAndDuplicate(t *testing.T) {
+// Keep the process/proxy/commit boundary real: previews and refusals must not
+// publish, and duplicate and supersede must add their edge and close the issue
+// in one commit, with the embedded route's unchecked close. It runs in
+// //cmd/bd:bd_managed_local_test (managed_local_shards.txt).
+func TestManagedLocalProxiedShipDuplicateSupersede(t *testing.T) {
 	requireManagedLocalProxiedEnv(t)
 	bd := buildEmbeddedBD(t)
 	p := bdManagedLocalInit(t, bd, "caproute", 5*time.Minute)
@@ -48,7 +50,7 @@ func TestProxiedShipAndDuplicate(t *testing.T) {
 		t.Helper()
 		before := history(t)
 		out, stderr, err := bdProxiedRunBuffersWithEnv(t, bd, p.dir, []string{"BD_READONLY=1"}, args...)
-		if err == nil || !strings.Contains(out+stderr, "read-only") {
+		if err == nil || !strings.Contains(out+stderr, "strict readonly is unavailable") {
 			t.Fatalf("readonly accepted %v: %v %s%s", args, err, out, stderr)
 		}
 		if history(t) != before {
@@ -128,20 +130,50 @@ func TestProxiedShipAndDuplicate(t *testing.T) {
 		if history(t) != before+1 {
 			t.Fatal("duplicate must publish one atomic commit")
 		}
-		protected := bdProxiedCreate(t, bd, p.dir, "protected task")
-		gate := call(t, "gate", "create", "--blocks", protected.ID, "--type", "human")
-		if _, err := bdProxiedRun(t, bd, p.dir, "config", "set", "gates.human.resolvers", `["owner"]`); err != nil {
-			t.Fatal(err)
-		}
+		// The embedded route closes through store.CloseIssue, which checks no
+		// assignee, pin, blocker or children; the proxied route must match it.
+		assigned := bdProxiedCreate(t, bd, p.dir, "assigned report", "--assignee", "bob")
 		before = history(t)
-		out, stderr, err := bdProxiedRunBuffers(t, bd, p.dir, "--actor", "agent", "duplicate", gate["id"].(string), "--of", canonical.ID)
-		if err == nil {
-			t.Fatalf("protected closure accepted: %s%s", out, stderr)
+		if got := call(t, "--actor", "agent", "duplicate", assigned.ID, "--of", canonical.ID); got["status"] != "closed" {
+			t.Fatalf("assigned duplicate: %v", got)
 		}
-		if count(t, "SELECT COUNT(*) FROM dependencies WHERE issue_id=? AND type='duplicates'", gate["id"]) != 0 ||
-			count(t, "SELECT COUNT(*) FROM issues WHERE id=? AND status='closed'", gate["id"]) != 0 || history(t) != before {
-			t.Fatal("refused duplicate leaked an edge, closure or history")
+		assertProxiedDepExistsWithType(t, db, assigned.ID, canonical.ID, "duplicates")
+		if count(t, "SELECT COUNT(*) FROM issues WHERE id=? AND status='closed'", assigned.ID) != 1 || history(t) != before+1 {
+			t.Fatal("assigned duplicate did not close in one commit")
 		}
-		readonly(t, "duplicate", protected.ID, "--of", canonical.ID)
+		open := bdProxiedCreate(t, bd, p.dir, "open report")
+		readonly(t, "duplicate", open.ID, "--of", canonical.ID)
+	})
+
+	t.Run("supersede", func(t *testing.T) {
+		old := bdProxiedCreate(t, bd, p.dir, "old design", "--id", "caproute-supersede-old")
+		replacement := bdProxiedCreate(t, bd, p.dir, "new design", "--id", "caproute-supersede-new")
+		before := history(t)
+		refuse(t, "itself", "supersede", old.ID, "--with", old.ID)
+		refuse(t, "failed to resolve", "supersede", old.ID, "--with", "caproute-absent")
+		if history(t) != before {
+			t.Fatal("invalid supersede wrote history")
+		}
+		got := call(t, "supersede", old.ID[:len(old.ID)-1], "--with", replacement.ID[:len(replacement.ID)-1])
+		if got["superseded"] != old.ID || got["replacement"] != replacement.ID || got["status"] != "closed" {
+			t.Fatalf("supersede result: %v", got)
+		}
+		assertProxiedDepExistsWithType(t, db, old.ID, replacement.ID, "supersedes")
+		if count(t, "SELECT COUNT(*) FROM issues WHERE id=? AND status='closed' AND closed_at IS NOT NULL", old.ID) != 1 {
+			t.Fatal("supersede did not persist complete closure")
+		}
+		if history(t) != before+1 {
+			t.Fatal("supersede must publish one atomic commit")
+		}
+		assigned := bdProxiedCreate(t, bd, p.dir, "assigned design", "--assignee", "bob")
+		before = history(t)
+		if got := call(t, "--actor", "agent", "supersede", assigned.ID, "--with", replacement.ID); got["status"] != "closed" {
+			t.Fatalf("assigned supersede: %v", got)
+		}
+		if count(t, "SELECT COUNT(*) FROM issues WHERE id=? AND status='closed'", assigned.ID) != 1 || history(t) != before+1 {
+			t.Fatal("assigned supersede did not close in one commit")
+		}
+		open := bdProxiedCreate(t, bd, p.dir, "open design")
+		readonly(t, "supersede", open.ID, "--with", replacement.ID)
 	})
 }

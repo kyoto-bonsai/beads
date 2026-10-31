@@ -44,7 +44,7 @@ func runDuplicateProxiedServer(_ *cobra.Command, args []string) error {
 		if err := uw.DependencyUseCase().AddDependency(ctx, dep, actor); err != nil {
 			return ids, "", fmt.Errorf("failed to add duplicate link: %w", err)
 		}
-		if _, err := uw.IssueUseCase().CloseIssueChecked(ctx, ids[0], domain.CloseIssueParams{}, actor, false); err != nil {
+		if _, err := uw.IssueUseCase().CloseIssue(ctx, ids[0], domain.CloseIssueParams{}, actor); err != nil {
 			return ids, "", fmt.Errorf("failed to close duplicate: %w", err)
 		}
 		return ids, "bd: duplicate " + ids[0] + " of " + ids[1], nil

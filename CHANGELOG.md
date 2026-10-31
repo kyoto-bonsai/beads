@@ -13,8 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   proxied-server workspace** (GH#7597). They used to refuse with `<command> is
   not supported in proxied-server mode`. Each now runs in one proxied unit of
   work: `ship` adds the `provides:` label through the guarded issue updater,
-  and `duplicate` and `supersede` add their edge and close the issue together,
-  so a refused close rolls the new edge back. Output follows the commit, and
+  and `duplicate` and `supersede` add their edge and close the issue in one
+  transaction, with the same unchecked close as the embedded route (an
+  assigned or pinned issue closes on both). Output follows the commit, and
   `ship --dry-run`, an already-shipped capability and every refusal publish no
   commit. `ship`'s capability selection, closed/`--force` rule and text and
   JSON output are shared with the embedded route, which is unchanged.
