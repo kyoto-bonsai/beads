@@ -1,5 +1,7 @@
 # gc-gate: beads upstream make test (Bazel unit/nogo/gofmt/repository guards) on the exact patch and base.
 # Publishes one receipt as the check-run annotation `gc-gate-receipt`. Dispatched only; no secrets.
+# Input lanes (JSON array) starts one job per gate lane (job lane, matrix), each publishing one `gc-gate-lane-receipt`
+# notice; job gate is unchanged.
 
 name: gc-gate
 run-name: "gate ${{ inputs.run_key }}"
@@ -17,6 +19,9 @@ on:
         required: true
         type: string
       run_key:
+        required: true
+        type: string
+      lanes:
         required: true
         type: string
 
@@ -597,3 +602,360 @@ jobs:
           else
             exit "${GATE_RC:-1}"
           fi
+
+  lane:
+    name: lane ${{ matrix.lane }}
+    if: inputs.lanes != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJSON(inputs.lanes) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      GATE_BAZEL_FLAGS: "--local_resources=memory=HOST_RAM*.5 --local_resources=cpu=HOST_CPUS*.75"
+      LANE: ${{ matrix.lane }}
+    steps:
+      - name: validate inputs
+        id: start
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          PATCH_SHA256: ${{ inputs.patch_sha256 }}
+          RUN_KEY: ${{ inputs.run_key }}
+          LANES_INPUT: ${{ inputs.lanes }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid head_sha: $HEAD_SHA"
+            exit 2
+          fi
+          if [[ ! "$BASE_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid base_sha: $BASE_SHA"
+            exit 2
+          fi
+          if [[ ! "$PATCH_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::Invalid patch_sha256: $PATCH_SHA256"
+            exit 2
+          fi
+          if [[ ! "$RUN_KEY" =~ ^[0-9a-f]{12}-[0-9]{10}$ ]]; then
+            echo "::error::Invalid run_key: $RUN_KEY"
+            exit 2
+          fi
+          lanes_re='^\[("[a-z-]+",?)*\]$'
+          if [[ ! "$LANES_INPUT" =~ $lanes_re ]]; then
+            echo "::error::Invalid lanes: $LANES_INPUT"
+            exit 2
+          fi
+          case "$LANE" in
+            check-docs | bazel-sync-check | test-integration) ;;
+            *) echo "::error::Invalid lane: $LANE"; exit 2 ;;
+          esac
+          START_EPOCH=$(date +%s)
+          STARTED_AT=$(date -u +%FT%TZ)
+          DISK_START=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+          {
+            echo "start_epoch=$START_EPOCH"
+            echo "started_at=$STARTED_AT"
+            echo "disk_start=$DISK_START"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ inputs.head_sha }}
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: verify base and patch
+        id: verify
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          PATCH_SHA: ${{ inputs.patch_sha256 }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$HEAD_SHA"
+          git fetch --no-tags --filter=blob:none https://github.com/gastownhall/beads.git "$BASE_SHA"
+          if ! git merge-base --is-ancestor "$BASE_SHA" "$HEAD_SHA"; then
+            echo "::error::base not ancestor"
+            exit 3
+          fi
+          RUNNER_PATCH=$(git diff --binary --full-index --no-renames --no-ext-diff --no-textconv --no-color -U3 "$BASE_SHA" "$HEAD_SHA" | sha256sum | cut -d' ' -f1)
+          echo "patch_sha_runner=$RUNNER_PATCH" >> "$GITHUB_OUTPUT"
+          if [ "$RUNNER_PATCH" != "$PATCH_SHA" ]; then
+            echo "::error::patch mismatch"
+            echo "GATE_PRE_FAIL=patch_mismatch" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+      - name: free disk
+        if: env.GATE_PRE_FAIL == ''
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL
+          df -B1 --output=avail / | tail -1
+
+      # 8 GiB of swap on the freed root disk: memory pressure pages out instead of taking the VM, and with it the
+      # receipt, down. GATE_SWAP_ADDED (bytes, 0 if not added) goes into the receipt.
+      - name: memory headroom
+        if: env.GATE_PRE_FAIL == ''
+        run: |
+          set -uo pipefail
+          swap=/gc-gate.swap
+          avail=$(df -B1 --output=avail / | tail -1 | tr -d ' ')
+          if [ "$avail" -gt 42949672960 ] && sudo fallocate -l 8G "$swap" && sudo chmod 600 "$swap" \
+              && sudo mkswap "$swap" > /dev/null && sudo swapon "$swap"; then
+            echo "GATE_SWAP_ADDED=8589934592" >> "$GITHUB_ENV"
+          else
+            echo "::warning::gc-gate swap file not added (root avail $avail bytes)"
+            echo "GATE_SWAP_ADDED=0" >> "$GITHUB_ENV"
+          fi
+          free -b || true
+          swapon --show || true
+
+      - name: Set up Bazel
+        if: env.GATE_PRE_FAIL == ''
+        uses: ./.github/actions/setup-bazel
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        if: env.GATE_PRE_FAIL == ''
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Provide /usr/local/go
+        if: env.GATE_PRE_FAIL == ''
+        run: |
+          if [ ! -e /usr/local/go ]; then
+            sudo ln -s "$(go env GOROOT)" /usr/local/go
+          elif [ ! -x /usr/local/go/bin/go ]; then
+            echo "::warning::/usr/local/go exists without bin/go; tests that exec go may fail"
+          fi
+
+      - name: lane run
+        id: run
+        if: env.GATE_PRE_FAIL == ''
+        timeout-minutes: 320
+        run: |
+          set -o pipefail
+          rc=0
+          stop=$(openssl rand -hex 16)
+          echo "::stop-commands::$stop"
+          case "$LANE" in
+            check-docs)
+              make check-docs BAZEL_FLAGS="$GATE_BAZEL_FLAGS --build_event_json_file=$RUNNER_TEMP/bep.json" 2>&1 | tee "$RUNNER_TEMP/lane.log" || rc=$?
+              ;;
+            bazel-sync-check)
+              make bazel-sync-check 2>&1 | tee "$RUNNER_TEMP/lane.log" || rc=$?
+              ;;
+            test-integration)
+              bazel test $GATE_BAZEL_FLAGS --config=ci --config=integration --build_event_json_file=$RUNNER_TEMP/bep.json //... 2>&1 | tee "$RUNNER_TEMP/lane.log" || rc=$?
+              ;;
+            *)
+              rc=2
+              ;;
+          esac
+          echo "::$stop::"
+          echo "LANE_RC=$rc" >> "$GITHUB_ENV"
+          echo "lane $LANE exit $rc"
+
+      - name: lane receipt
+        if: always()
+        timeout-minutes: 10
+        env:
+          HEAD_SHA: ${{ inputs.head_sha }}
+          BASE_SHA: ${{ inputs.base_sha }}
+          PATCH_SHA: ${{ inputs.patch_sha256 }}
+          RUN_KEY: ${{ inputs.run_key }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          SERVER: ${{ github.server_url }}
+          WF_SHA: ${{ github.workflow_sha }}
+          START_EPOCH: ${{ steps.start.outputs.start_epoch }}
+          STARTED_AT: ${{ steps.start.outputs.started_at }}
+          PATCH_SHA_RUNNER: ${{ steps.verify.outputs.patch_sha_runner }}
+        run: |
+          ulimit -v 2097152
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          import time
+          from datetime import datetime, timezone
+
+          lane = os.environ["LANE"]
+          COMMANDS = {
+              "check-docs": 'make check-docs BAZEL_FLAGS="$GATE_BAZEL_FLAGS --build_event_json_file=$RUNNER_TEMP/bep.json"',
+              "bazel-sync-check": "make bazel-sync-check",
+              "test-integration": "bazel test $GATE_BAZEL_FLAGS --config=ci --config=integration --build_event_json_file=$RUNNER_TEMP/bep.json //...",
+          }
+          lane_command = COMMANDS.get(lane)
+          os.environ["LANE_COMMAND"] = lane_command or ""
+
+          lane_rc = os.environ.get("LANE_RC")
+          gate_pre_fail = os.environ.get("GATE_PRE_FAIL")
+
+          if lane_rc is not None and lane_rc.isdigit():
+              rc = int(lane_rc)
+          elif gate_pre_fail:
+              rc = 2
+          else:
+              rc = 1
+
+          runner_temp = os.environ.get("RUNNER_TEMP", "/tmp")
+          bep_path = os.path.join(runner_temp, "bep.json")
+          counts = None
+          test_statuses = None
+          bep_deadline_hit = False
+          bep_deadline = time.monotonic() + 240
+
+          if os.path.isfile(bep_path):
+              targets = 0
+              passed = 0
+              failed = 0
+              flaky = 0
+              no_status = 0
+              test_summary_labels = set()
+              test_result_runs = {}
+              test_statuses = {}
+
+              with open(bep_path, "r", encoding="utf-8", errors="replace") as f:
+                  for line in f:
+                      if time.monotonic() > bep_deadline:
+                          bep_deadline_hit = True
+                          break
+                      line_str = line.strip()
+                      if not line_str:
+                          continue
+                      try:
+                          event = json.loads(line_str)
+                      except Exception:
+                          continue
+
+                      event_id = event.get("id")
+                      if not isinstance(event_id, dict):
+                          continue
+
+                      if "testResult" in event_id:
+                          tr_id = event_id.get("testResult")
+                          if isinstance(tr_id, dict):
+                              label = tr_id.get("label")
+                              if label:
+                                  tr_payload = event.get("testResult")
+                                  cached_loc = False
+                                  cached_rem = False
+                                  if isinstance(tr_payload, dict):
+                                      cached_loc = bool(tr_payload.get("cachedLocally"))
+                                      exec_info = tr_payload.get("executionInfo")
+                                      if isinstance(exec_info, dict):
+                                          cached_rem = bool(exec_info.get("cachedRemotely"))
+                                  is_cached = cached_loc or cached_rem
+                                  test_result_runs.setdefault(label, []).append(is_cached)
+
+                      if "testSummary" in event_id:
+                          targets += 1
+                          ts_id = event_id.get("testSummary")
+                          label = None
+                          if isinstance(ts_id, dict):
+                              label = ts_id.get("label")
+                              if label:
+                                  test_summary_labels.add(label)
+                          ts_payload = event.get("testSummary")
+                          status = ""
+                          if isinstance(ts_payload, dict):
+                              status = ts_payload.get("overallStatus", "")
+
+                          if status == "PASSED":
+                              passed += 1
+                          elif status == "FLAKY":
+                              flaky += 1
+                          elif status in ("FAILED", "TIMEOUT", "REMOTE_FAILURE", "FAILED_TO_BUILD", "INCOMPLETE"):
+                              failed += 1
+                          elif status == "NO_STATUS":
+                              no_status += 1
+                          else:
+                              failed += 1
+
+                          if label:
+                              test_statuses[label] = status
+
+              cached = sum(
+                  1 for label, runs in test_result_runs.items()
+                  if label in test_summary_labels and runs and all(runs)
+              )
+
+              if bep_deadline_hit:
+                  counts = None
+                  test_statuses = None
+              else:
+                  counts = {
+                      "targets": targets,
+                      "passed": passed,
+                      "failed": failed,
+                      "flaky": flaky,
+                      "cached": cached,
+                      "no_status": no_status,
+                  }
+
+          df_out = subprocess.check_output(["df", "-B1", "--output=avail", "/"], text=True)
+          disk_free_end_bytes = int(df_out.strip().splitlines()[-1].strip())
+
+          start_epoch_str = os.environ.get("START_EPOCH", "0")
+          start_epoch = int(start_epoch_str) if start_epoch_str.isdigit() else int(time.time())
+          now = int(time.time())
+          duration_s = now - start_epoch
+
+          started_at = os.environ.get("STARTED_AT", "")
+          finished_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+          head_sha = os.environ.get("HEAD_SHA", "")
+          base_sha = os.environ.get("BASE_SHA", "")
+          patch_sha = os.environ.get("PATCH_SHA", "")
+          run_key = os.environ.get("RUN_KEY", "")
+          repo = os.environ.get("REPO", "")
+          run_id = int(os.environ.get("RUN_ID", "0"))
+          run_attempt = int(os.environ.get("RUN_ATTEMPT", "1"))
+          server = os.environ.get("SERVER", "https://github.com")
+          wf_sha = os.environ.get("WF_SHA", "")
+          patch_sha_runner = os.environ.get("PATCH_SHA_RUNNER") or None
+
+          receipt = {
+              "schema": 1,
+              "kind": "lane",
+              "lane": lane,
+              "command": COMMANDS.get(lane),
+              "bazel_flags": os.environ.get("GATE_BAZEL_FLAGS", ""),
+              "rc": rc,
+              "pre_fail": gate_pre_fail or None,
+              "counts": counts,
+              "test_statuses": test_statuses,
+              "bep_deadline_hit": bool(bep_deadline_hit),
+              "run_key": run_key,
+              "repo": repo,
+              "head_sha": head_sha,
+              "base_sha": base_sha,
+              "patch_sha256": patch_sha,
+              "patch_sha256_runner": patch_sha_runner,
+              "run_id": run_id,
+              "run_attempt": run_attempt,
+              "run_url": f"{server}/{repo}/actions/runs/{run_id}",
+              "workflow_sha": wf_sha,
+              "started_at": started_at,
+              "finished_at": finished_at,
+              "duration_s": duration_s,
+              "disk_free_end_bytes": disk_free_end_bytes,
+          }
+
+          receipt_json = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+          print(receipt_json)
+          notice_b64 = base64.b64encode(receipt_json.encode("utf-8")).decode("ascii")
+          print(f"::notice title=gc-gate-lane-receipt::{notice_b64}")
+          PY
+
+      - name: result
+        if: always()
+        run: |
+          if [ -n "$GATE_PRE_FAIL" ]; then exit 1; else exit "${LANE_RC:-1}"; fi
