@@ -775,7 +775,7 @@ jobs:
               make bazel-sync-check 2>&1 | tee "$RUNNER_TEMP/lane.log" || rc=$?
               ;;
             test-integration)
-              bazel test $GATE_BAZEL_FLAGS --config=ci --config=integration --build_event_json_file=$RUNNER_TEMP/bep.json //... 2>&1 | tee "$RUNNER_TEMP/lane.log" || rc=$?
+              bazel test $GATE_BAZEL_FLAGS --config=integration --build_event_json_file=$RUNNER_TEMP/bep.json //... 2>&1 | tee "$RUNNER_TEMP/lane.log" || rc=$?
               ;;
             *)
               rc=2
@@ -816,7 +816,7 @@ jobs:
           COMMANDS = {
               "check-docs": 'make check-docs BAZEL_FLAGS="$GATE_BAZEL_FLAGS --build_event_json_file=$RUNNER_TEMP/bep.json"',
               "bazel-sync-check": "make bazel-sync-check",
-              "test-integration": "bazel test $GATE_BAZEL_FLAGS --config=ci --config=integration --build_event_json_file=$RUNNER_TEMP/bep.json //...",
+              "test-integration": "bazel test $GATE_BAZEL_FLAGS --config=integration --build_event_json_file=$RUNNER_TEMP/bep.json //...",
           }
           lane_command = COMMANDS.get(lane)
           os.environ["LANE_COMMAND"] = lane_command or ""
