@@ -1234,6 +1234,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the export is not left staged at its old content. It also decides whether
   the commit touches `.beads` from that index, and in a linked worktree no
   longer re-stages an export you removed with `git rm` (#4080).
+- **`bd show` no longer suggests a cross-store ID never existed** (#5259). An
+  ID whose prefix this workspace's store does not issue (`issue_prefix` or
+  `allowed_prefixes`), and that no `routes.jsonl` route names, may live in a
+  store bd never asked, yet its miss printed the same "may have never
+  existed" hint as a missing local ID. That hint now says the prefix is not
+  one this store issues, that the miss does not mean the issue is absent, and
+  to run the command from a workspace attached to the store that issues it.
+  The error line and exit status are unchanged.
+
 - **bd again reads `GT_ROOT` from a rig's `.beads/.env`** (#8117; also
   shipped in 1.3.4). `gc rig add` writes the city root there, and the
   `.beads/.env` allowlist from #7879 (also in 1.3.3) dropped it, printing
